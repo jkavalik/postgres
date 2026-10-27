@@ -60,6 +60,7 @@
 #include "commands/comment.h"
 #include "commands/defrem.h"
 #include "commands/event_trigger.h"
+#include "commands/progress.h"
 #include "commands/repack.h"
 #include "commands/sequence.h"
 #include "commands/tablecmds.h"
@@ -210,6 +211,8 @@ typedef struct AlteredTableInfo
 	List	   *changedStatisticsOids;	/* OIDs of statistics to rebuild */
 	List	   *changedStatisticsDefs;	/* string definitions of same */
 	List	   *changedStatisticsOwners;	/* owners of same */
+	/* Progress reporting decision, made at the start of Phase 3: */
+	bool		progress_counted;	/* counted in relations_total? */
 } AlteredTableInfo;
 
 /* Struct describing one new constraint to check in Phase 3 scan */
@@ -241,6 +244,17 @@ typedef struct NewColumnValue
 	ExprState  *exprstate;		/* execution state */
 	bool		is_generated;	/* is it a GENERATED expression? */
 } NewColumnValue;
+
+/*
+ * State for reporting the progress of one table scan in ALTER TABLE
+ */
+typedef struct ATScanProgress
+{
+	bool		active;			/* report anything? */
+	BlockNumber last_block;		/* block of the previous tuple */
+	int64		blocks_total;	/* -1 if blocks are not reported (non-heap) */
+	int64		ntuples;
+} ATScanProgress;
 
 /*
  * Error-reporting support for RemoveRelations
@@ -471,7 +485,8 @@ static CoercionPathType findFkeyCast(Oid targetTypeId, Oid sourceTypeId,
 									 Oid *funcid);
 static void validateForeignKeyConstraint(char *conname,
 										 Relation rel, Relation pkrel,
-										 Oid pkindOid, Oid constraintOid, bool hasperiod);
+										 Oid pkindOid, Oid constraintOid, bool hasperiod,
+										 bool report_progress);
 static void CheckAlterTableIsSafe(Relation rel);
 static void ATController(AlterTableStmt *parsetree,
 						 Relation rel, List *cmds, bool recurse, LOCKMODE lockmode,
@@ -493,6 +508,14 @@ static void ATRewriteTables(AlterTableStmt *parsetree,
 							List **wqueue, LOCKMODE lockmode,
 							AlterTableUtilityContext *context);
 static void ATRewriteTable(AlteredTableInfo *tab, Oid OIDNewHeap);
+static bool ATTableNeedsScan(AlteredTableInfo *tab, Relation rel);
+static bool ATProgressStart(AlterTableStmt *parsetree, List *wqueue);
+static int64 ATRelationBlocks(Relation rel);
+static void ATScanProgressBegin(ATScanProgress *progress, bool active,
+								int64 phase, Relation rel, TableScanDesc scan);
+static void ATScanProgressTuple(ATScanProgress *progress, TableScanDesc scan,
+								TupleTableSlot *slot);
+static void ATScanProgressEnd(ATScanProgress *progress);
 static AlteredTableInfo *ATGetQueueEntry(List **wqueue, Relation rel);
 static void ATSimplePermissions(AlterTableType cmdtype, Relation rel, int allowed_targets);
 static void ATSimpleRecursion(List **wqueue, Relation rel,
@@ -693,7 +716,8 @@ static void ATPrepChangePersistence(AlteredTableInfo *tab, Relation rel,
 									bool toLogged);
 static void ATPrepSetTableSpace(AlteredTableInfo *tab, Relation rel,
 								const char *tablespacename, LOCKMODE lockmode);
-static void ATExecSetTableSpace(Oid tableOid, Oid newTableSpace, LOCKMODE lockmode);
+static void ATExecSetTableSpace(Oid tableOid, Oid newTableSpace, LOCKMODE lockmode,
+								bool report_progress);
 static void ATExecSetTableSpaceNoStorage(Relation rel, Oid newTableSpace);
 static void ATExecSetRelOptions(Relation rel, List *defList,
 								AlterTableType operation,
@@ -5909,6 +5933,13 @@ ATRewriteTables(AlterTableStmt *parsetree, List **wqueue, LOCKMODE lockmode,
 				AlterTableUtilityContext *context)
 {
 	ListCell   *ltab;
+	bool		progress;
+
+	/*
+	 * Decide what to report and start progress reporting, unless there is
+	 * nothing to scan, rewrite, copy or validate.
+	 */
+	progress = ATProgressStart(parsetree, *wqueue);
 
 	/* Go through each table that needs to be checked or rewritten */
 	foreach(ltab, *wqueue)
@@ -5918,6 +5949,25 @@ ATRewriteTables(AlterTableStmt *parsetree, List **wqueue, LOCKMODE lockmode,
 		/* Relations without storage may be ignored here */
 		if (!RELKIND_HAS_STORAGE(tab->relkind))
 			continue;
+
+		if (tab->progress_counted)
+		{
+			const int	index[] = {
+				PROGRESS_ALTER_TABLE_CURRENT_RELID,
+				PROGRESS_ALTER_TABLE_PHASE,
+				PROGRESS_ALTER_TABLE_TUPLES_SCANNED,
+				PROGRESS_ALTER_TABLE_BLOCKS_TOTAL,
+				PROGRESS_ALTER_TABLE_BLOCKS_DONE,
+				PROGRESS_ALTER_TABLE_INDEX_REBUILD_TOTAL,
+				PROGRESS_ALTER_TABLE_INDEX_REBUILD_DONE,
+				PROGRESS_ALTER_TABLE_CURRENT_CONSTRAINT
+			};
+			const int64 val[] = {
+				tab->relid, 0, 0, 0, 0, 0, 0, 0
+			};
+
+			pgstat_progress_update_multi_param(lengthof(index), index, val);
+		}
 
 		/*
 		 * If we change column data types, the operation has to be propagated
@@ -6060,6 +6110,34 @@ ATRewriteTables(AlterTableStmt *parsetree, List **wqueue, LOCKMODE lockmode,
 			ATRewriteTable(tab, OIDNewHeap);
 
 			/*
+			 * Report the number of indexes about to be rebuilt.  This is done
+			 * only now, after the table_rewrite event trigger, which could
+			 * have dropped some; reindex_relation() gets a fresh list too.
+			 * The scan counters do not apply to the following phases.
+			 */
+			if (tab->progress_counted)
+			{
+				const int	index[] = {
+					PROGRESS_ALTER_TABLE_INDEX_REBUILD_TOTAL,
+					PROGRESS_ALTER_TABLE_TUPLES_SCANNED,
+					PROGRESS_ALTER_TABLE_BLOCKS_TOTAL,
+					PROGRESS_ALTER_TABLE_BLOCKS_DONE
+				};
+				int64		val[4];
+				Relation	rel;
+				List	   *indexlist;
+
+				rel = relation_open(tab->relid, NoLock);
+				indexlist = RelationGetIndexList(rel);
+				val[0] = list_length(indexlist);
+				val[1] = val[2] = val[3] = 0;
+				list_free(indexlist);
+				relation_close(rel, NoLock);
+
+				pgstat_progress_update_multi_param(lengthof(index), index, val);
+			}
+
+			/*
 			 * Swap the physical files of the old and new heaps, then rebuild
 			 * indexes and discard the old heap.  We can use RecentXmin for
 			 * the table's new relfrozenxid because we rewrote all the tuples
@@ -6074,7 +6152,7 @@ ATRewriteTables(AlterTableStmt *parsetree, List **wqueue, LOCKMODE lockmode,
 							 RecentXmin,
 							 ReadNextMultiXactId(),
 							 persistence,
-							 false);
+							 tab->progress_counted);
 
 			InvokeObjectPostAlterHook(RelationRelationId, tab->relid, 0);
 		}
@@ -6099,7 +6177,8 @@ ATRewriteTables(AlterTableStmt *parsetree, List **wqueue, LOCKMODE lockmode,
 			 * just do a block-by-block copy.
 			 */
 			if (tab->newTableSpace)
-				ATExecSetTableSpace(tab->relid, tab->newTableSpace, lockmode);
+				ATExecSetTableSpace(tab->relid, tab->newTableSpace, lockmode,
+									tab->progress_counted);
 		}
 
 		/*
@@ -6118,6 +6197,9 @@ ATRewriteTables(AlterTableStmt *parsetree, List **wqueue, LOCKMODE lockmode,
 				SequenceChangePersistence(seq_relid, tab->newrelpersistence);
 			}
 		}
+
+		if (tab->progress_counted)
+			pgstat_progress_incr_param(PROGRESS_ALTER_TABLE_RELATIONS_DONE, 1);
 	}
 
 	/*
@@ -6146,6 +6228,32 @@ ATRewriteTables(AlterTableStmt *parsetree, List **wqueue, LOCKMODE lockmode,
 				Constraint *fkconstraint = (Constraint *) con->qual;
 				Relation	refrel;
 
+				/*
+				 * Report the validation before locking the referenced table,
+				 * so that a wait for that lock is shown as part of it.  The
+				 * single-query check does not measure tuples or blocks.
+				 */
+				if (progress)
+				{
+					const int	index[] = {
+						PROGRESS_ALTER_TABLE_CURRENT_RELID,
+						PROGRESS_ALTER_TABLE_CURRENT_CONSTRAINT,
+						PROGRESS_ALTER_TABLE_PHASE,
+						PROGRESS_ALTER_TABLE_TUPLES_SCANNED,
+						PROGRESS_ALTER_TABLE_BLOCKS_TOTAL,
+						PROGRESS_ALTER_TABLE_BLOCKS_DONE,
+						PROGRESS_ALTER_TABLE_INDEX_REBUILD_TOTAL,
+						PROGRESS_ALTER_TABLE_INDEX_REBUILD_DONE
+					};
+					const int64 val[] = {
+						tab->relid, con->conid,
+						PROGRESS_ALTER_TABLE_PHASE_VALIDATE_FKEYS,
+						-1, -1, -1, 0, 0
+					};
+
+					pgstat_progress_update_multi_param(lengthof(index), index, val);
+				}
+
 				if (rel == NULL)
 				{
 					/* Long since locked, no need for another */
@@ -6157,7 +6265,8 @@ ATRewriteTables(AlterTableStmt *parsetree, List **wqueue, LOCKMODE lockmode,
 				validateForeignKeyConstraint(fkconstraint->conname, rel, refrel,
 											 con->refindid,
 											 con->conid,
-											 con->conwithperiod);
+											 con->conwithperiod,
+											 progress);
 
 				/*
 				 * No need to mark the constraint row as validated, we did
@@ -6165,12 +6274,22 @@ ATRewriteTables(AlterTableStmt *parsetree, List **wqueue, LOCKMODE lockmode,
 				 */
 
 				table_close(refrel, NoLock);
+
+				if (progress)
+					pgstat_progress_incr_param(PROGRESS_ALTER_TABLE_FKEYS_DONE, 1);
 			}
 		}
 
 		if (rel)
 			table_close(rel, NoLock);
 	}
+
+	/*
+	 * End progress reporting before the afterStmts: they can contain a nested
+	 * ALTER TABLE, which reports progress of its own.
+	 */
+	if (progress)
+		pgstat_progress_end_command();
 
 	/* Finally, run any afterStmts that were queued up */
 	foreach(ltab, *wqueue)
@@ -6201,7 +6320,7 @@ ATRewriteTable(AlteredTableInfo *tab, Oid OIDNewHeap)
 	Relation	newrel;
 	TupleDesc	oldTupDesc;
 	TupleDesc	newTupDesc;
-	bool		needscan = false;
+	bool		needscan;
 	List	   *notnull_attrs;
 	List	   *notnull_virtual_attrs;
 	int			i;
@@ -6261,7 +6380,6 @@ ATRewriteTable(AlteredTableInfo *tab, Oid OIDNewHeap)
 		switch (con->contype)
 		{
 			case CONSTR_CHECK:
-				needscan = true;
 				con->qualstate = ExecPrepareExpr((Expr *) expand_generated_columns_in_expr(con->qual, oldrel, 1), estate);
 				break;
 			case CONSTR_FOREIGN:
@@ -6275,10 +6393,7 @@ ATRewriteTable(AlteredTableInfo *tab, Oid OIDNewHeap)
 
 	/* Build expression execution states for partition check quals */
 	if (tab->partition_constraint)
-	{
-		needscan = true;
 		partqualstate = ExecPrepareExpr(tab->partition_constraint, estate);
-	}
 
 	foreach(l, tab->newvals)
 	{
@@ -6317,9 +6432,10 @@ ATRewriteTable(AlteredTableInfo *tab, Oid OIDNewHeap)
 														wholeatt->attnum);
 			}
 		}
-		if (notnull_attrs || notnull_virtual_attrs)
-			needscan = true;
 	}
+
+	/* Without a rewrite, scan only if something needs checking */
+	needscan = ATTableNeedsScan(tab, oldrel);
 
 	if (newrel || needscan)
 	{
@@ -6332,6 +6448,7 @@ ATRewriteTable(AlteredTableInfo *tab, Oid OIDNewHeap)
 		ListCell   *lc;
 		Snapshot	snapshot;
 		ResultRelInfo *rInfo = NULL;
+		ATScanProgress progress;
 
 		/*
 		 * When adding or changing a virtual generated column with a not-null
@@ -6427,6 +6544,11 @@ ATRewriteTable(AlteredTableInfo *tab, Oid OIDNewHeap)
 		snapshot = RegisterSnapshot(GetLatestSnapshot());
 		scan = table_beginscan(oldrel, snapshot, 0, NULL,
 							   SO_NONE);
+
+		ATScanProgressBegin(&progress, tab->progress_counted,
+							newrel ? PROGRESS_ALTER_TABLE_PHASE_REWRITE_TABLE :
+							PROGRESS_ALTER_TABLE_PHASE_SCAN_TABLE,
+							oldrel, scan);
 
 		/*
 		 * Switch to per-tuple memory context and reset it for each tuple
@@ -6601,10 +6723,14 @@ ATRewriteTable(AlteredTableInfo *tab, Oid OIDNewHeap)
 				table_tuple_insert(newrel, insertslot, mycid,
 								   ti_options, bistate);
 
+			ATScanProgressTuple(&progress, scan, oldslot);
+
 			ResetExprContext(econtext);
 
 			CHECK_FOR_INTERRUPTS();
 		}
+
+		ATScanProgressEnd(&progress);
 
 		MemoryContextSwitchTo(oldCxt);
 		table_endscan(scan);
@@ -6626,6 +6752,313 @@ ATRewriteTable(AlteredTableInfo *tab, Oid OIDNewHeap)
 
 		table_close(newrel, NoLock);
 	}
+}
+
+/*
+ * ATTableNeedsScan: will ATRewriteTable scan this table without a rewrite?
+ *
+ * ATRewriteTable and the progress pre-pass both use this, so they cannot
+ * disagree.  rel may be NULL, in which case the relation is opened only if
+ * needed.
+ */
+static bool
+ATTableNeedsScan(AlteredTableInfo *tab, Relation rel)
+{
+	ListCell   *l;
+	bool		found = false;
+
+	foreach(l, tab->constraints)
+	{
+		NewConstraint *con = lfirst(l);
+
+		if (con->contype == CONSTR_CHECK)
+			return true;
+	}
+
+	if (tab->partition_constraint)
+		return true;
+
+	/* New not-null constraints need a scan only if some are valid */
+	if (tab->verify_new_notnull)
+	{
+		bool		own_rel = (rel == NULL);
+		TupleDesc	tupdesc;
+
+		if (own_rel)
+			rel = relation_open(tab->relid, NoLock);
+		tupdesc = RelationGetDescr(rel);
+
+		for (int i = 0; i < tupdesc->natts; i++)
+		{
+			CompactAttribute *attr = TupleDescCompactAttr(tupdesc, i);
+
+			if (attr->attnullability == ATTNULLABLE_VALID &&
+				!attr->attisdropped)
+			{
+				found = true;
+				break;
+			}
+		}
+
+		if (own_rel)
+			relation_close(rel, NoLock);
+	}
+
+	return found;
+}
+
+/*
+ * ATProgressStart: decide what ALTER TABLE phase 3 will report, and start
+ * progress reporting if there is anything to report.
+ *
+ * Sets progress_counted in each work queue entry, and returns whether
+ * progress reporting was started.  Relations are opened only when the
+ * decision needs them, so catalog-only ALTERs stay cheap.
+ *
+ * A table_rewrite event trigger runs during phase 3 and could change a later
+ * entry's table.  That is harmless: relations_done is incremented once per
+ * counted entry, and entries that were not counted never report, so nothing
+ * is attributed to the wrong relation.  The work queue itself cannot change,
+ * so the number of foreign keys to validate is exact.
+ */
+static bool
+ATProgressStart(AlterTableStmt *parsetree, List *wqueue)
+{
+	ListCell   *ltab;
+	int64		relations_total = 0;
+	int64		fkeys_total = 0;
+	AlteredTableInfo *first;
+	int64		command;
+
+	foreach(ltab, wqueue)
+	{
+		AlteredTableInfo *tab = (AlteredTableInfo *) lfirst(ltab);
+		ListCell   *lcon;
+
+		tab->progress_counted = false;
+
+		/* Same filter as the phase 3 loops */
+		if (!RELKIND_HAS_STORAGE(tab->relkind))
+			continue;
+
+		foreach(lcon, tab->constraints)
+		{
+			NewConstraint *con = lfirst(lcon);
+
+			if (con->contype == CONSTR_FOREIGN)
+				fkeys_total++;
+		}
+
+		/* Sequences have negligible work; don't report them */
+		if (tab->relkind == RELKIND_SEQUENCE)
+			continue;
+
+		if (tab->rewrite > 0)
+			tab->progress_counted = true;
+		else
+		{
+			if (ATTableNeedsScan(tab, NULL))
+				tab->progress_counted = true;
+
+			/*
+			 * A tablespace move is copied only without a rewrite (with one,
+			 * make_new_heap creates the new storage in the new tablespace).
+			 * CheckRelationTableSpaceMove() may raise an error here rather
+			 * than later; the outcome is the same.
+			 */
+			if (tab->newTableSpace)
+			{
+				Relation	rel = relation_open(tab->relid, NoLock);
+
+				if (CheckRelationTableSpaceMove(rel, tab->newTableSpace))
+					tab->progress_counted = true;
+				relation_close(rel, NoLock);
+			}
+		}
+
+		if (tab->progress_counted)
+			relations_total++;
+	}
+
+	if (relations_total == 0 && fkeys_total == 0)
+		return false;
+
+	/* The first entry is always the relation named in the command */
+	first = (AlteredTableInfo *) linitial(wqueue);
+
+	/* Internal callers (ALTER ... ALL IN TABLESPACE) have no parsetree */
+	switch (parsetree ? parsetree->objtype : get_relkind_objtype(first->relkind))
+	{
+		case OBJECT_TABLE:
+			command = PROGRESS_ALTER_TABLE_COMMAND_TABLE;
+			break;
+		case OBJECT_INDEX:
+			command = PROGRESS_ALTER_TABLE_COMMAND_INDEX;
+			break;
+		case OBJECT_MATVIEW:
+			command = PROGRESS_ALTER_TABLE_COMMAND_MATVIEW;
+			break;
+		case OBJECT_FOREIGN_TABLE:
+			command = PROGRESS_ALTER_TABLE_COMMAND_FOREIGN_TABLE;
+			break;
+		case OBJECT_TYPE:
+			command = PROGRESS_ALTER_TABLE_COMMAND_TYPE;
+			break;
+		default:
+			command = 0;
+			break;
+	}
+
+	pgstat_progress_start_command(PROGRESS_COMMAND_ALTER_TABLE, first->relid);
+	{
+		const int	index[] = {
+			PROGRESS_ALTER_TABLE_COMMAND,
+			PROGRESS_ALTER_TABLE_RELATIONS_TOTAL,
+			PROGRESS_ALTER_TABLE_FKEYS_TOTAL
+		};
+		const int64 val[] = {command, relations_total, fkeys_total};
+
+		pgstat_progress_update_multi_param(lengthof(index), index, val);
+	}
+
+	return true;
+}
+
+/* Number of blocks in all existing forks of a relation */
+static int64
+ATRelationBlocks(Relation rel)
+{
+	int64		nblocks = 0;
+
+	for (ForkNumber forknum = 0; forknum <= MAX_FORKNUM; forknum++)
+	{
+		if (smgrexists(RelationGetSmgr(rel), forknum))
+			nblocks += smgrnblocks(RelationGetSmgr(rel), forknum);
+	}
+
+	return nblocks;
+}
+
+/*
+ * ATScanProgressBegin: start reporting the progress of a table scan.
+ *
+ * Blocks are reported only for heap tables, through heapam's own scan
+ * position; for other table AMs they are reported as -1 ("not measured").
+ */
+static void
+ATScanProgressBegin(ATScanProgress *progress, bool active, int64 phase,
+					Relation rel, TableScanDesc scan)
+{
+	const int	index[] = {
+		PROGRESS_ALTER_TABLE_PHASE,
+		PROGRESS_ALTER_TABLE_TUPLES_SCANNED,
+		PROGRESS_ALTER_TABLE_BLOCKS_TOTAL,
+		PROGRESS_ALTER_TABLE_BLOCKS_DONE
+	};
+	int64		val[4];
+
+	progress->active = active;
+	if (!active)
+		return;
+
+	progress->last_block = InvalidBlockNumber;
+	progress->ntuples = 0;
+
+	if (rel->rd_tableam == GetHeapamTableAmRoutine())
+	{
+		BlockNumber total;
+		BlockNumber done;
+
+		/* Only the total is meaningful before the first tuple is fetched */
+		heap_scan_get_progress(scan, &total, &done);
+		progress->blocks_total = total;
+	}
+	else
+		progress->blocks_total = -1;
+
+	val[0] = phase;
+	val[1] = 0;
+	val[2] = progress->blocks_total;
+	val[3] = progress->blocks_total < 0 ? -1 : 0;
+	pgstat_progress_update_multi_param(lengthof(index), index, val);
+}
+
+/*
+ * ATScanProgressTuple: count one more scanned tuple.
+ *
+ * For heap tables, the counters are published only when the scan moves to a
+ * new block, so the cost per tuple is just a block number comparison; the
+ * tuple count shown is then up to one block behind.  For other table AMs,
+ * which have no block position, the tuple count is published for every
+ * tuple.
+ */
+static void
+ATScanProgressTuple(ATScanProgress *progress, TableScanDesc scan,
+					TupleTableSlot *slot)
+{
+	BlockNumber blkno;
+
+	if (!progress->active)
+		return;
+
+	progress->ntuples++;
+
+	if (progress->blocks_total >= 0)
+	{
+		blkno = ItemPointerGetBlockNumber(&slot->tts_tid);
+		if (blkno != progress->last_block)
+		{
+			/* total again: index builds in user code may overwrite it */
+			const int	index[] = {
+				PROGRESS_ALTER_TABLE_TUPLES_SCANNED,
+				PROGRESS_ALTER_TABLE_BLOCKS_TOTAL,
+				PROGRESS_ALTER_TABLE_BLOCKS_DONE
+			};
+			int64		val[3];
+			BlockNumber total;
+			BlockNumber done;
+
+			progress->last_block = blkno;
+			heap_scan_get_progress(scan, &total, &done);
+			val[0] = progress->ntuples;
+			val[1] = total;
+			val[2] = done;
+			pgstat_progress_update_multi_param(lengthof(index), index, val);
+		}
+	}
+	else
+		pgstat_progress_update_param(PROGRESS_ALTER_TABLE_TUPLES_SCANNED,
+									 progress->ntuples);
+}
+
+/*
+ * ATScanProgressEnd: the scan is complete.  Publish the exact final counts:
+ * the tuple count may lag one block behind, and the scan position always
+ * does.
+ */
+static void
+ATScanProgressEnd(ATScanProgress *progress)
+{
+	if (!progress->active)
+		return;
+
+	if (progress->blocks_total >= 0)
+	{
+		/* total again, as in ATScanProgressTuple */
+		const int	index[] = {
+			PROGRESS_ALTER_TABLE_TUPLES_SCANNED,
+			PROGRESS_ALTER_TABLE_BLOCKS_TOTAL,
+			PROGRESS_ALTER_TABLE_BLOCKS_DONE
+		};
+		const int64 val[] = {
+			progress->ntuples, progress->blocks_total, progress->blocks_total
+		};
+
+		pgstat_progress_update_multi_param(lengthof(index), index, val);
+	}
+	else
+		pgstat_progress_update_param(PROGRESS_ALTER_TABLE_TUPLES_SCANNED,
+									 progress->ntuples);
 }
 
 /*
@@ -14187,7 +14620,8 @@ validateForeignKeyConstraint(char *conname,
 							 Relation pkrel,
 							 Oid pkindOid,
 							 Oid constraintOid,
-							 bool hasperiod)
+							 bool hasperiod,
+							 bool report_progress)
 {
 	TupleTableSlot *slot;
 	TableScanDesc scan;
@@ -14195,6 +14629,7 @@ validateForeignKeyConstraint(char *conname,
 	Snapshot	snapshot;
 	MemoryContext oldcxt;
 	MemoryContext perTupCxt;
+	ATScanProgress progress;
 
 	ereport(DEBUG1,
 			(errmsg_internal("validating foreign key constraint \"%s\"", conname)));
@@ -14231,6 +14666,8 @@ validateForeignKeyConstraint(char *conname,
 	slot = table_slot_create(rel, NULL);
 	scan = table_beginscan(rel, snapshot, 0, NULL,
 						   SO_NONE);
+	ATScanProgressBegin(&progress, report_progress,
+						PROGRESS_ALTER_TABLE_PHASE_VALIDATE_FKEYS, rel, scan);
 	perTupCxt = AllocSetContextCreate(CurrentMemoryContext,
 									  "validateForeignKeyConstraint",
 									  ALLOCSET_SMALL_SIZES);
@@ -14265,7 +14702,11 @@ validateForeignKeyConstraint(char *conname,
 		RI_FKey_check_ins(fcinfo);
 
 		MemoryContextReset(perTupCxt);
+
+		ATScanProgressTuple(&progress, scan, slot);
 	}
+
+	ATScanProgressEnd(&progress);
 
 	MemoryContextSwitchTo(oldcxt);
 	MemoryContextDelete(perTupCxt);
@@ -17528,9 +17969,13 @@ ATExecSetRelOptions(Relation rel, List *defList, AlterTableType operation,
 /*
  * Execute ALTER TABLE SET TABLESPACE for cases where there is no tuple
  * rewriting to be done, so we just want to copy the data as fast as possible.
+ *
+ * If report_progress is true, the copy of each relation (including the TOAST
+ * table and its indexes) is reported as ALTER TABLE progress.
  */
 static void
-ATExecSetTableSpace(Oid tableOid, Oid newTableSpace, LOCKMODE lockmode)
+ATExecSetTableSpace(Oid tableOid, Oid newTableSpace, LOCKMODE lockmode,
+					bool report_progress)
 {
 	Relation	rel;
 	Oid			reltoastrelid;
@@ -17538,6 +17983,8 @@ ATExecSetTableSpace(Oid tableOid, Oid newTableSpace, LOCKMODE lockmode)
 	RelFileLocator newrlocator;
 	List	   *reltoastidxids = NIL;
 	ListCell   *lc;
+	int64		total = -1;
+	int			saved_param;
 
 	/*
 	 * Need lock here in case we are recursing to toast table or index
@@ -17575,16 +18022,53 @@ ATExecSetTableSpace(Oid tableOid, Oid newTableSpace, LOCKMODE lockmode)
 	newrlocator.relNumber = newrelfilenumber;
 	newrlocator.spcOid = newTableSpace;
 
+	/*
+	 * Blocks can be counted only where RelationCopyStorage() does the
+	 * copying: for indexes and heap tables.  Other table AMs copy their own
+	 * storage.
+	 */
+	if (report_progress)
+	{
+		const int	index[] = {
+			PROGRESS_ALTER_TABLE_CURRENT_RELID,
+			PROGRESS_ALTER_TABLE_PHASE,
+			PROGRESS_ALTER_TABLE_TUPLES_SCANNED,
+			PROGRESS_ALTER_TABLE_BLOCKS_TOTAL,
+			PROGRESS_ALTER_TABLE_BLOCKS_DONE
+		};
+		int64		val[5];
+
+		if (rel->rd_rel->relkind == RELKIND_INDEX ||
+			rel->rd_tableam == GetHeapamTableAmRoutine())
+			total = ATRelationBlocks(rel);
+		val[0] = tableOid;
+		val[1] = PROGRESS_ALTER_TABLE_PHASE_COPY_RELATION;
+		val[2] = 0;
+		val[3] = total;
+		val[4] = total < 0 ? -1 : 0;
+		pgstat_progress_update_multi_param(lengthof(index), index, val);
+	}
+	saved_param = SetRelationCopyStorageProgress(total < 0 ? -1 :
+												 PROGRESS_ALTER_TABLE_BLOCKS_DONE);
+
 	/* hand off to AM to actually create new rel storage and copy the data */
-	if (rel->rd_rel->relkind == RELKIND_INDEX)
+	PG_TRY();
 	{
-		index_copy_data(rel, newrlocator);
+		if (rel->rd_rel->relkind == RELKIND_INDEX)
+		{
+			index_copy_data(rel, newrlocator);
+		}
+		else
+		{
+			Assert(RELKIND_HAS_TABLE_AM(rel->rd_rel->relkind));
+			table_relation_copy_data(rel, &newrlocator);
+		}
 	}
-	else
+	PG_FINALLY();
 	{
-		Assert(RELKIND_HAS_TABLE_AM(rel->rd_rel->relkind));
-		table_relation_copy_data(rel, &newrlocator);
+		SetRelationCopyStorageProgress(saved_param);
 	}
+	PG_END_TRY();
 
 	/*
 	 * Update the pg_class row.
@@ -17607,9 +18091,11 @@ ATExecSetTableSpace(Oid tableOid, Oid newTableSpace, LOCKMODE lockmode)
 
 	/* Move associated toast relation and/or indexes, too */
 	if (OidIsValid(reltoastrelid))
-		ATExecSetTableSpace(reltoastrelid, newTableSpace, lockmode);
+		ATExecSetTableSpace(reltoastrelid, newTableSpace, lockmode,
+							report_progress);
 	foreach(lc, reltoastidxids)
-		ATExecSetTableSpace(lfirst_oid(lc), newTableSpace, lockmode);
+		ATExecSetTableSpace(lfirst_oid(lc), newTableSpace, lockmode,
+							report_progress);
 
 	/* Clean up */
 	list_free(reltoastidxids);

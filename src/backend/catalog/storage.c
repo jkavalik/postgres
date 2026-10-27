@@ -461,6 +461,25 @@ RelationPreTruncate(Relation rel)
 		pending->is_truncated = true;
 }
 
+static int	copy_storage_progress_param = -1;
+
+/*
+ * Set the progress parameter that RelationCopyStorage() increments for each
+ * block it copies (-1 to disable), and return the previous setting.
+ *
+ * This is used by ALTER TABLE ... SET TABLESPACE, which copies storage
+ * through table AM callbacks that have no way to pass such an argument.
+ * Callers must restore the previous value when done, including on error.
+ */
+int
+SetRelationCopyStorageProgress(int param)
+{
+	int			old = copy_storage_progress_param;
+
+	copy_storage_progress_param = param;
+	return old;
+}
+
 /*
  * Copy a fork's data, block by block.
  *
@@ -470,9 +489,10 @@ RelationPreTruncate(Relation rel)
  *
  * Also note that this is frequently called via locutions such as
  *		RelationCopyStorage(RelationGetSmgr(rel), ...);
- * That's safe only because we perform only smgr and WAL operations here.
- * If we invoked anything else, a relcache flush could cause our SMgrRelation
- * argument to become a dangling pointer.
+ * That's safe only because we perform only smgr and WAL operations here,
+ * plus progress reporting, which only writes this backend's own status
+ * entry.  If we invoked anything else, a relcache flush could cause our
+ * SMgrRelation argument to become a dangling pointer.
  */
 void
 RelationCopyStorage(SMgrRelation src, SMgrRelation dst,
@@ -556,6 +576,9 @@ RelationCopyStorage(SMgrRelation src, SMgrRelation dst,
 		 * page including any unused space.
 		 */
 		smgr_bulk_write(bulkstate, blkno, buf, false);
+
+		if (copy_storage_progress_param >= 0)
+			pgstat_progress_incr_param(copy_storage_progress_param, 1);
 	}
 	smgr_bulk_finish(bulkstate);
 }

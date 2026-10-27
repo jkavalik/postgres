@@ -361,6 +361,8 @@ pg_stat_get_progress_info(PG_FUNCTION_ARGS)
 		cmdtype = PROGRESS_COMMAND_COPY;
 	else if (pg_strcasecmp(cmd, "DATACHECKSUMS") == 0)
 		cmdtype = PROGRESS_COMMAND_DATACHECKSUMS;
+	else if (pg_strcasecmp(cmd, "ALTER TABLE") == 0)
+		cmdtype = PROGRESS_COMMAND_ALTER_TABLE;
 	else
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),

@@ -1,0 +1,295 @@
+--
+-- Progress reporting for ALTER TABLE (pg_stat_progress_alter_table)
+--
+-- User code that runs during the ALTER (CHECK constraints, USING
+-- expressions, index expressions, partition keys, equality operators used by
+-- foreign key validation) reads this backend's own row from the view and
+-- prints it.  The test runs in a parallel group, so every query filters on
+-- pg_backend_pid().
+--
+
+-- Prints the progress row when the marker argument is "interesting" and the
+-- reported state differs from the last state printed.  The last state is kept
+-- in a session setting, which needs no privileges; it is reset before each
+-- case.  Inside an index build the setting is rolled back after the build
+-- and then reads as '', so NULL and '' are treated alike.  Everything is
+-- schema-qualified because index expressions run with a restricted
+-- search_path.  The function is marked IMMUTABLE only so that it can be used
+-- in index expressions and partition keys.  Tuple and block counts are
+-- printed only as "greater than zero", because heap scans publish them once
+-- per block and block boundaries depend on the page size.
+CREATE FUNCTION public.alter_progress_print(marker int) RETURNS int
+LANGUAGE plpgsql IMMUTABLE AS $$
+DECLARE
+    r record;
+    state text;
+BEGIN
+    IF marker IS NULL OR NOT (marker % 100 = 1 OR marker = 1000) THEN
+        RETURN marker;
+    END IF;
+
+    PERFORM pg_catalog.pg_stat_clear_snapshot();
+    SELECT p.command, p.phase,
+           p.relid::pg_catalog.regclass AS rel,
+           p.current_relid::pg_catalog.regclass AS cur,
+           p.relations_total, p.relations_done,
+           p.fkeys_total, p.fkeys_done,
+           (SELECT c.conname FROM pg_catalog.pg_constraint c
+             WHERE c.oid = p.current_constraint) AS conname,
+           p.tuples_scanned > 0 AS some_tuples,
+           p.blocks_total > 0 AS has_blocks,
+           p.blocks_done > 0 AS some_blocks_done,
+           p.blocks_done <= p.blocks_total AS blocks_ok,
+           p.index_rebuild_total, p.index_rebuild_done
+      INTO r
+      FROM pg_catalog.pg_stat_progress_alter_table p
+     WHERE p.pid = pg_catalog.pg_backend_pid();
+
+    -- not inside an ALTER TABLE that reports progress (or not visible)
+    IF r.phase IS NULL THEN
+        RETURN marker;
+    END IF;
+
+    state := pg_catalog.concat_ws(' ', marker, r.phase, r.cur, r.relations_done,
+                                  r.fkeys_done, r.conname, r.some_tuples,
+                                  r.index_rebuild_done);
+    IF COALESCE(pg_catalog.current_setting('alter_progress.last', true), '') = state THEN
+        RETURN marker;
+    END IF;
+    PERFORM pg_catalog.set_config('alter_progress.last', state, false);
+
+    RAISE INFO '% | % on % | % | current % | relations %/% | fkeys %/% % | tuples % | blocks % % % | indexes %/%',
+        marker, r.command, r.rel, r.phase, r.cur,
+        r.relations_done, r.relations_total,
+        r.fkeys_done, r.fkeys_total, r.conname,
+        r.some_tuples, r.has_blocks, r.some_blocks_done, r.blocks_ok,
+        r.index_rebuild_done, r.index_rebuild_total;
+    RETURN marker;
+END
+$$;
+
+CREATE FUNCTION alter_progress_reset() RETURNS void
+LANGUAGE sql AS $$ SELECT set_config('alter_progress.last', '', false) $$;
+
+-- No work for phase 3: no row at all
+CREATE TABLE ap_plain (a int, b int);
+INSERT INTO ap_plain SELECT g, g FROM generate_series(1, 10) g;
+SELECT alter_progress_reset();
+ALTER TABLE ap_plain ADD COLUMN c int;
+SELECT count(*) FROM pg_stat_progress_alter_table WHERE pid = pg_backend_pid();
+
+-- Scan only: ADD CHECK
+SELECT alter_progress_reset();
+ALTER TABLE ap_plain ADD CONSTRAINT ap_plain_chk CHECK (alter_progress_print(a) > 0);
+
+-- Scan only: CHECK NOT VALID, then VALIDATE
+ALTER TABLE ap_plain ADD CONSTRAINT ap_plain_chk2 CHECK (alter_progress_print(a) > 0) NOT VALID;
+SELECT alter_progress_reset();
+ALTER TABLE ap_plain VALIDATE CONSTRAINT ap_plain_chk2;
+
+-- Rewrite: the USING expression prints
+SELECT alter_progress_reset();
+ALTER TABLE ap_plain ALTER b TYPE bigint USING alter_progress_print(a);
+
+-- Counters advance over several blocks: markers at rows 1, 101, ..., 1000.
+-- The rows are wide enough that row 101 is past the first block for any
+-- block size.
+CREATE TABLE ap_big (a int, pad text);
+INSERT INTO ap_big SELECT g, repeat('x', 1000) FROM generate_series(1, 1000) g;
+SELECT alter_progress_reset();
+ALTER TABLE ap_big ADD CONSTRAINT ap_big_chk CHECK (alter_progress_print(a) > 0);
+
+-- Partitioned table: one row per partition, relid is the parent
+CREATE TABLE ap_part (a int) PARTITION BY RANGE (a);
+CREATE TABLE ap_part1 PARTITION OF ap_part FOR VALUES FROM (0) TO (100);
+CREATE TABLE ap_part2 PARTITION OF ap_part FOR VALUES FROM (100) TO (200);
+CREATE TABLE ap_part3 PARTITION OF ap_part FOR VALUES FROM (200) TO (300);
+INSERT INTO ap_part VALUES (1), (101), (201);
+SELECT alter_progress_reset();
+ALTER TABLE ap_part ADD CONSTRAINT ap_part_chk CHECK (alter_progress_print(a) > 0);
+
+-- Index rebuild after a rewrite.  The two expression indexes are on a column
+-- the ALTER does not change, so phase 2 leaves them alone.
+-- index_rebuild_done is the number of indexes finished, so it reads 0 while
+-- the first index is built and 1 while the second one is.
+CREATE TABLE ap_idx (a int, b int);
+INSERT INTO ap_idx VALUES (1, 1), (2, 2);
+CREATE INDEX ap_idx_1 ON ap_idx (alter_progress_print(a));
+CREATE INDEX ap_idx_2 ON ap_idx ((alter_progress_print(a) + 0));
+SELECT alter_progress_reset();
+ALTER TABLE ap_idx ALTER b TYPE bigint;
+
+-- ALTER TYPE rewrites a typed table: command is ALTER TYPE and relid is the
+-- composite type's relation, while the typed table is processed
+CREATE TYPE ap_type AS (a int, b int);
+CREATE TABLE ap_typed OF ap_type;
+INSERT INTO ap_typed VALUES (1, 1);
+CREATE INDEX ap_typed_idx ON ap_typed (alter_progress_print(a));
+SELECT alter_progress_reset();
+ALTER TYPE ap_type ALTER ATTRIBUTE b TYPE bigint CASCADE;
+
+-- A REFRESH MATERIALIZED VIEW run from inside the ALTER must not change the
+-- ALTER's phase or index count: REFRESH swaps relation files and rebuilds
+-- indexes too, but must not report those.  Its index build does overwrite
+-- the block counters (index AMs write them regardless of the active
+-- command), so right after the REFRESH (row 1) they read zero; the scan
+-- publishes them again at the next block, so row 101 shows them restored.
+CREATE TABLE ap_mv_base (a int);
+INSERT INTO ap_mv_base VALUES (1);
+CREATE MATERIALIZED VIEW ap_mv AS SELECT a FROM ap_mv_base;
+CREATE INDEX ap_mv_a ON ap_mv (a);
+CREATE FUNCTION ap_refresh_and_print(marker int) RETURNS int
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF marker = 1 THEN
+        REFRESH MATERIALIZED VIEW ap_mv;
+    END IF;
+    RETURN alter_progress_print(marker);
+END
+$$;
+CREATE TABLE ap_refresh (a int, b int, pad text);
+INSERT INTO ap_refresh SELECT g, g, repeat('x', 1000) FROM generate_series(1, 101) g;
+CREATE INDEX ON ap_refresh (a);
+SELECT alter_progress_reset();
+ALTER TABLE ap_refresh ALTER b TYPE bigint USING ap_refresh_and_print(a);
+
+-- The scan decision for NOT NULL: a virtual generated column whose only
+-- not-null constraint is NOT VALID gets verify_new_notnull from SET
+-- EXPRESSION but is not scanned, so only the parent counts.
+CREATE TABLE ap_vp (a int, v int GENERATED ALWAYS AS (a) VIRTUAL);
+CREATE TABLE ap_vc () INHERITS (ap_vp);
+INSERT INTO ap_vp (a) VALUES (1);
+INSERT INTO ap_vc (a) VALUES (101);
+ALTER TABLE ap_vc ADD CONSTRAINT ap_vc_v_nn NOT NULL v NOT VALID;
+SELECT alter_progress_reset();
+ALTER TABLE ap_vp ALTER v SET EXPRESSION AS (a * 2),
+  ADD CONSTRAINT ap_vp_chk CHECK (alter_progress_print(a) > 0) NO INHERIT;
+
+-- SET NOT NULL: the child counts only because of verify_new_notnull, the
+-- parent because of its own CHECK; both are scanned.
+CREATE TABLE ap_np (a int, c int);
+CREATE TABLE ap_nc () INHERITS (ap_np);
+INSERT INTO ap_np VALUES (1, 1);
+INSERT INTO ap_nc VALUES (101, 101);
+SELECT alter_progress_reset();
+ALTER TABLE ap_np ALTER c SET NOT NULL,
+  ADD CONSTRAINT ap_np_chk CHECK (alter_progress_print(a) > 0) NO INHERIT;
+
+-- The same through VALIDATE of a NOT VALID not-null constraint
+ALTER TABLE ap_np ADD COLUMN d int DEFAULT 1;
+ALTER TABLE ap_np ADD CONSTRAINT ap_np_d_nn NOT NULL d NOT VALID;
+SELECT alter_progress_reset();
+ALTER TABLE ap_np VALIDATE CONSTRAINT ap_np_d_nn,
+  ADD CONSTRAINT ap_np_chk2 CHECK (alter_progress_print(a) > 0) NO INHERIT;
+
+-- ATTACH PARTITION: the partition key calls the print function while the
+-- partition constraint is checked, so no CHECK is involved
+CREATE TABLE ap_pt (a int) PARTITION BY RANGE (alter_progress_print(a));
+CREATE TABLE ap_pa (a int);
+INSERT INTO ap_pa VALUES (1), (2);
+SELECT alter_progress_reset();
+ALTER TABLE ap_pt ATTACH PARTITION ap_pa FOR VALUES FROM (0) TO (100);
+
+-- SET TABLESPACE: the table is scanned for the CHECK, then copied block by
+-- block together with its TOAST table and index.  No user code runs during
+-- the copy, so only the scan is visible here, but the copy path runs.
+CREATE TABLE ap_move (a int, t text);
+INSERT INTO ap_move
+  SELECT 1, string_agg(md5(i::text), '') FROM generate_series(1, 500) i;
+SELECT alter_progress_reset();
+ALTER TABLE ap_move ADD CONSTRAINT ap_move_chk CHECK (alter_progress_print(a) > 0),
+  SET TABLESPACE regress_tblspace;
+SELECT c.relname LIKE 'pg_toast%' AS is_toast, t.spcname
+  FROM pg_class c JOIN pg_tablespace t ON t.oid = c.reltablespace
+ WHERE c.oid IN ('ap_move'::regclass,
+                 (SELECT reltoastrelid FROM pg_class WHERE oid = 'ap_move'::regclass))
+ ORDER BY 1;
+SELECT length(t) FROM ap_move;
+
+--
+-- Foreign key validation, observed through a btree operator class for int4
+-- whose equality operator is a PL/pgSQL function.  A primary key cannot name
+-- an operator class, so the referenced table gets a unique index instead.
+-- With index and bitmap scans off, RI_Initial_Check's query can only be a
+-- nested loop of sequential scans (the operator is neither mergejoinable
+-- nor hashjoinable), which evaluates the operator as the join qual.
+--
+CREATE FUNCTION ap_eq(int4, int4) RETURNS bool
+LANGUAGE plpgsql IMMUTABLE AS $$
+BEGIN
+    IF $1 = $2 THEN
+        PERFORM alter_progress_print($1);
+    END IF;
+    RETURN $1 = $2;
+END
+$$;
+CREATE OPERATOR =^= (LEFTARG = int4, RIGHTARG = int4, PROCEDURE = ap_eq,
+                     COMMUTATOR = =^=);
+CREATE OPERATOR CLASS ap_int4_ops FOR TYPE int4 USING btree AS
+    OPERATOR 1 <, OPERATOR 2 <=, OPERATOR 3 =^=, OPERATOR 4 >=, OPERATOR 5 >,
+    FUNCTION 1 btint4cmp(int4, int4);
+CREATE TABLE ap_pk (id int4);
+INSERT INTO ap_pk SELECT g FROM generate_series(1, 300) g;
+CREATE UNIQUE INDEX ap_pk_id ON ap_pk (id ap_int4_ops);
+
+CREATE TABLE ap_fk (id int4) PARTITION BY RANGE (id);
+CREATE TABLE ap_fk1 PARTITION OF ap_fk FOR VALUES FROM (0) TO (100);
+CREATE TABLE ap_fk2 PARTITION OF ap_fk FOR VALUES FROM (100) TO (200);
+INSERT INTO ap_fk VALUES (1), (101);
+
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+
+-- Path: RI_Initial_Check.  One validation per leaf; nothing else counts.
+SELECT alter_progress_reset();
+ALTER TABLE ap_fk ADD CONSTRAINT ap_fk_fk FOREIGN KEY (id) REFERENCES ap_pk (id);
+
+-- Path: RI_Initial_Check.  A no-op SET TABLESPACE does not count.
+CREATE TABLE ap_fk3 (id int4);
+INSERT INTO ap_fk3 VALUES (1);
+SELECT alter_progress_reset();
+ALTER TABLE ap_fk3 ADD CONSTRAINT ap_fk3_fk FOREIGN KEY (id) REFERENCES ap_pk (id),
+  SET TABLESPACE pg_default;
+
+-- Path: RI_Initial_Check, queued by VALIDATE CONSTRAINT
+CREATE TABLE ap_fk4 (id int4);
+INSERT INTO ap_fk4 VALUES (1);
+ALTER TABLE ap_fk4 ADD CONSTRAINT ap_fk4_fk FOREIGN KEY (id) REFERENCES ap_pk (id) NOT VALID;
+SELECT alter_progress_reset();
+ALTER TABLE ap_fk4 VALIDATE CONSTRAINT ap_fk4_fk;
+
+RESET enable_indexscan;
+RESET enable_bitmapscan;
+
+-- Path: per-row checks.  The role owns the referencing table and has
+-- REFERENCES, but no SELECT, on the referenced table, so RI_Initial_Check
+-- falls back to checking each row.  Those checks run as the referenced
+-- table's owner (the superuser running this test), who can see the row.
+CREATE ROLE regress_alter_progress;
+CREATE TABLE ap_fk5 (id int4, pad text);
+INSERT INTO ap_fk5 SELECT g, repeat('x', 1000) FROM generate_series(1, 101) g;
+ALTER TABLE ap_fk5 OWNER TO regress_alter_progress;
+GRANT REFERENCES ON ap_pk TO regress_alter_progress;
+SET ROLE regress_alter_progress;
+SELECT alter_progress_reset();
+ALTER TABLE ap_fk5 ADD CONSTRAINT ap_fk5_fk FOREIGN KEY (id) REFERENCES ap_pk (id);
+RESET ROLE;
+
+-- Clean up
+DROP TABLE ap_fk5;
+REVOKE REFERENCES ON ap_pk FROM regress_alter_progress;
+DROP ROLE regress_alter_progress;
+DROP TABLE ap_fk, ap_fk3, ap_fk4, ap_pk;
+DROP OPERATOR CLASS ap_int4_ops USING btree;
+DROP OPERATOR FAMILY ap_int4_ops USING btree;
+DROP OPERATOR =^= (int4, int4);
+DROP FUNCTION ap_eq(int4, int4);
+DROP TABLE ap_typed;
+DROP TYPE ap_type;
+DROP TABLE ap_move, ap_pt, ap_np, ap_nc, ap_vp, ap_vc, ap_refresh, ap_idx, ap_part,
+  ap_big, ap_plain;
+DROP MATERIALIZED VIEW ap_mv;
+DROP TABLE ap_mv_base;
+DROP FUNCTION ap_refresh_and_print(int);
+DROP FUNCTION alter_progress_reset();
+DROP FUNCTION alter_progress_print(int);

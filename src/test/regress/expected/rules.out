@@ -1982,6 +1982,51 @@ pg_stat_lock| SELECT locktype,
     fastpath_exceeded,
     stats_reset
    FROM pg_stat_get_lock() l(locktype, waits, wait_time, fastpath_exceeded, stats_reset);
+pg_stat_progress_alter_table| SELECT s.pid,
+    s.datid,
+    d.datname,
+    s.relid,
+        CASE s.param1
+            WHEN 1 THEN 'ALTER TABLE'::text
+            WHEN 2 THEN 'ALTER INDEX'::text
+            WHEN 3 THEN 'ALTER MATERIALIZED VIEW'::text
+            WHEN 4 THEN 'ALTER FOREIGN TABLE'::text
+            WHEN 5 THEN 'ALTER TYPE'::text
+            ELSE NULL::text
+        END AS command,
+        CASE s.param2
+            WHEN 0 THEN 'initializing'::text
+            WHEN 1 THEN 'scanning table'::text
+            WHEN 2 THEN 'rewriting table'::text
+            WHEN 3 THEN 'copying relation'::text
+            WHEN 6 THEN 'swapping relation files'::text
+            WHEN 7 THEN 'rebuilding index'::text
+            WHEN 8 THEN 'performing final cleanup'::text
+            WHEN 9 THEN 'validating foreign keys'::text
+            ELSE NULL::text
+        END AS phase,
+    (s.param7)::oid AS current_relid,
+    s.param3 AS relations_total,
+    s.param4 AS relations_done,
+    (s.param6)::oid AS current_constraint,
+    s.param14 AS fkeys_total,
+    s.param15 AS fkeys_done,
+        CASE s.param5
+            WHEN '-1'::integer THEN NULL::bigint
+            ELSE s.param5
+        END AS tuples_scanned,
+        CASE s.param16
+            WHEN '-1'::integer THEN NULL::bigint
+            ELSE s.param16
+        END AS blocks_total,
+        CASE s.param17
+            WHEN '-1'::integer THEN NULL::bigint
+            ELSE s.param17
+        END AS blocks_done,
+    s.param9 AS index_rebuild_total,
+    s.param10 AS index_rebuild_done
+   FROM (pg_stat_get_progress_info('ALTER TABLE'::text) s(pid, datid, relid, param1, param2, param3, param4, param5, param6, param7, param8, param9, param10, param11, param12, param13, param14, param15, param16, param17, param18, param19, param20)
+     LEFT JOIN pg_database d ON ((s.datid = d.oid)));
 pg_stat_progress_analyze| SELECT s.pid,
     s.datid,
     d.datname,

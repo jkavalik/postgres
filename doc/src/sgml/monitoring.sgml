@@ -382,6 +382,15 @@ postgres   27093  0.0  0.0  30096  2752 ?        Ss   11:34   0:00 postgres: ser
      </row>
 
      <row>
+      <entry><structname>pg_stat_progress_alter_table</structname><indexterm><primary>pg_stat_progress_alter_table</primary></indexterm></entry>
+      <entry>One row for each backend running an <command>ALTER TABLE</command>
+       (or related command) that scans, rewrites or copies a table or
+       validates a foreign key, showing current progress.
+       See <xref linkend="alter-table-progress-reporting"/>.
+      </entry>
+     </row>
+
+     <row>
       <entry><structname>pg_stat_progress_analyze</structname><indexterm><primary>pg_stat_progress_analyze</primary></indexterm></entry>
       <entry>One row for each backend (including autovacuum worker processes) running
        <command>ANALYZE</command>, showing current progress.
@@ -6483,7 +6492,8 @@ FROM pg_stat_get_backend_idset() AS backendid;
   <para>
    <productname>PostgreSQL</productname> has the ability to report the progress of
    certain commands during command execution.  Currently, the only commands
-   which support progress reporting are <command>ANALYZE</command>,
+   which support progress reporting are <command>ALTER TABLE</command>,
+   <command>ANALYZE</command>,
    <command>COPY</command>, <command>CREATE INDEX</command>,
    <command>REPACK</command> (and its obsolete spelling <command>CLUSTER</command>),
    <command>VACUUM</command>,
@@ -6492,6 +6502,330 @@ FROM pg_stat_get_backend_idset() AS backendid;
    a base backup), and online data checksum operations.
    This may be expanded in the future.
   </para>
+
+ <sect2 id="alter-table-progress-reporting">
+  <title>ALTER TABLE Progress Reporting</title>
+
+  <indexterm>
+   <primary>pg_stat_progress_alter_table</primary>
+  </indexterm>
+
+  <para>
+   Whenever <command>ALTER TABLE</command>, or <command>ALTER INDEX</command>,
+   <command>ALTER MATERIALIZED VIEW</command>, <command>ALTER FOREIGN
+   TABLE</command> or <command>ALTER TYPE</command>, has to scan, rewrite or
+   copy the data of a table or index, or validate a foreign key, the
+   <structname>pg_stat_progress_alter_table</structname> view will contain a
+   row for the backend running it, from the point where the catalog changes
+   have been made.  Commands that only change the catalogs do not appear.
+   One command can process several relations, such as the partitions of a
+   partitioned table; foreign keys are validated after all of them.
+  </para>
+
+  <para>
+   The tuple and block counters describe only the current scan, rewrite,
+   copy or validation, and are <literal>NULL</literal> where it is not
+   measured: blocks for tables using a table access method other than
+   <literal>heap</literal>, and both while a foreign key is validated with a
+   single query, which is the usual case.  In other phases they are zero,
+   except that the block counters show the table scan of each index being
+   rebuilt, and are not reset for the final cleanup.  Indexes are rebuilt,
+   and reported here, only when the table is rewritten; other index builds
+   are reported in
+   <structname>pg_stat_progress_create_index</structname>, so on a
+   partitioned table an index on a partition can appear first there, while
+   it is built, and later here, when it is rebuilt after a rewrite.
+  </para>
+
+ <table id="pg-stat-progress-alter-table-view" xreflabel="pg_stat_progress_alter_table">
+   <title><structname>pg_stat_progress_alter_table</structname> View</title>
+   <tgroup cols="1">
+    <thead>
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       Column Type
+      </para>
+      <para>
+       Description
+      </para></entry>
+     </row>
+    </thead>
+
+    <tbody>
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>pid</structfield> <type>integer</type>
+      </para>
+      <para>
+       Process ID of backend.
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>datid</structfield> <type>oid</type>
+      </para>
+      <para>
+       OID of the database to which this backend is connected.
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>datname</structfield> <type>name</type>
+      </para>
+      <para>
+       Name of the database to which this backend is connected.
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>relid</structfield> <type>oid</type>
+      </para>
+      <para>
+       OID of the relation named in the command.  This is usually a table,
+       but it is an index for <command>ALTER INDEX</command> and a composite
+       type's relation for <command>ALTER TYPE</command>.
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>command</structfield> <type>text</type>
+      </para>
+      <para>
+       The command that is running: <literal>ALTER TABLE</literal>,
+       <literal>ALTER INDEX</literal>, <literal>ALTER MATERIALIZED
+       VIEW</literal>, <literal>ALTER FOREIGN TABLE</literal> or
+       <literal>ALTER TYPE</literal>.  For commands run internally, such as
+       <literal>ALTER TABLE ALL IN TABLESPACE</literal>, which processes each
+       relation as a separate command, it is derived from the kind of
+       relation.
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>phase</structfield> <type>text</type>
+      </para>
+      <para>
+       Current processing phase. See <xref linkend="alter-table-phases"/>.
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>current_relid</structfield> <type>oid</type>
+      </para>
+      <para>
+       OID of the relation currently being processed, for example a
+       partition of the table named in the command, or a
+       <acronym>TOAST</acronym> table or index being copied.
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>relations_total</structfield> <type>bigint</type>
+      </para>
+      <para>
+       Number of relations that will be scanned, rewritten or copied.  A
+       moved table's <acronym>TOAST</acronym> table and its index are not
+       counted separately.
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>relations_done</structfield> <type>bigint</type>
+      </para>
+      <para>
+       Number of relations already processed.
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>current_constraint</structfield> <type>oid</type>
+      </para>
+      <para>
+       OID of the foreign key constraint being validated, or zero outside the
+       <literal>validating foreign keys</literal> phase.
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>fkeys_total</structfield> <type>bigint</type>
+      </para>
+      <para>
+       Number of foreign key validations to perform: one per foreign key and
+       referencing table, counting each partition separately.
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>fkeys_done</structfield> <type>bigint</type>
+      </para>
+      <para>
+       Number of foreign key validations already performed.
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>tuples_scanned</structfield> <type>bigint</type>
+      </para>
+      <para>
+       Number of tuples scanned by the current scan, rewrite or validation,
+       or <literal>NULL</literal> if not measured.  For tables using the
+       <literal>heap</literal> access method this is updated once per block,
+       so while the scan runs it can lag up to one block behind.
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>blocks_total</structfield> <type>bigint</type>
+      </para>
+      <para>
+       Number of blocks the current scan, rewrite, validation or copy will
+       process (while indexes are rebuilt: the table scan of the current
+       index build), or <literal>NULL</literal> if not measured.  A copy to a
+       new tablespace counts the blocks of all forks.
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>blocks_done</structfield> <type>bigint</type>
+      </para>
+      <para>
+       Number of blocks already processed, or <literal>NULL</literal> if not
+       measured.  During a scan or rewrite, it advances only when a block with
+       rows visible to the command is reached, so a long run of blocks holding
+       only dead rows shows as a pause, as does
+       <structfield>tuples_scanned</structfield>.  During a copy to a new
+       tablespace, it stays at zero while the table's modified buffers are
+       written out before the copy starts.
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>index_rebuild_total</structfield> <type>bigint</type>
+      </para>
+      <para>
+       Number of indexes to rebuild after the current table has been
+       rewritten.
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>index_rebuild_done</structfield> <type>bigint</type>
+      </para>
+      <para>
+       Number of indexes already rebuilt.  It is zero while the first index is
+       being built.
+      </para></entry>
+     </row>
+    </tbody>
+   </tgroup>
+  </table>
+
+  <table id="alter-table-phases">
+   <title>ALTER TABLE Phases</title>
+   <tgroup cols="2">
+    <colspec colname="col1" colwidth="1*"/>
+    <colspec colname="col2" colwidth="2*"/>
+    <thead>
+    <row>
+      <entry>Phase</entry>
+      <entry>Description</entry>
+     </row>
+    </thead>
+
+   <tbody>
+    <row>
+     <entry><literal>initializing</literal></entry>
+     <entry>
+       The command is preparing to process the next relation.  Before a
+       table is rewritten, this includes running
+       <literal>table_rewrite</literal> event triggers.
+     </entry>
+    </row>
+    <row>
+     <entry><literal>scanning table</literal></entry>
+     <entry>
+       The command is reading the table to check new constraints, without
+       rewriting it.
+     </entry>
+    </row>
+    <row>
+     <entry><literal>copying relation</literal></entry>
+     <entry>
+       The command is copying a table or index, block by block, to a new
+       tablespace.
+     </entry>
+    </row>
+    <row>
+     <entry><literal>rewriting table</literal></entry>
+     <entry>
+       The command is writing a new copy of the table, checking new
+       constraints as it goes.
+     </entry>
+    </row>
+    <row>
+     <entry><literal>swapping relation files</literal></entry>
+     <entry>
+       The command is swapping the newly written table into place.
+     </entry>
+    </row>
+    <row>
+     <entry><literal>rebuilding index</literal></entry>
+     <entry>
+       The command is rebuilding the indexes of the rewritten table.
+     </entry>
+    </row>
+    <row>
+     <entry><literal>performing final cleanup</literal></entry>
+     <entry>
+       The command is finishing the rewrite of the current table.  The block
+       counters are left as the last index build left them, which depends on
+       the index access method.
+     </entry>
+    </row>
+    <row>
+     <entry><literal>validating foreign keys</literal></entry>
+     <entry>
+       The command is checking that the existing rows of the referencing
+       table satisfy a new or newly validated foreign key.  This happens after
+       all relations have been processed.
+     </entry>
+    </row>
+   </tbody>
+   </tgroup>
+  </table>
+
+  <para>
+   Each relation goes through one of two paths: it is either scanned and/or
+   copied to a new tablespace, or rewritten, after which the new copy is
+   swapped in, its indexes are rebuilt and the old copy is cleaned up.
+   Foreign keys are validated after all relations have been processed.
+   The table lists the phases in that order.
+  </para>
+
+  <para>
+   User code that runs while the command works on the data (a function in a
+   <literal>CHECK</literal> constraint or index expression, or a
+   <literal>table_rewrite</literal> event trigger) ends the reporting for the
+   rest of the command if it runs another command that reports progress, or
+   if it catches an error in an exception block.
+  </para>
+ </sect2>
 
  <sect2 id="analyze-progress-reporting">
   <title>ANALYZE Progress Reporting</title>

@@ -430,6 +430,10 @@ extern void simple_heap_update(Relation relation, const ItemPointerData *otid,
 extern TransactionId heap_index_delete_tuples(Relation rel,
 											  TM_IndexDeleteOp *delstate);
 
+/* in heap/heapam_handler.c */
+extern void heap_scan_get_progress(TableScanDesc sscan, BlockNumber *total,
+								   BlockNumber *done);
+
 /* in heap/heapam_indexscan.c */
 extern bool heapam_fetch_tid(Relation rel, ItemPointer tid, Snapshot snapshot,
 							 bool *all_dead);

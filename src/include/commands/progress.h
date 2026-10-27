@@ -107,6 +107,47 @@
 #define PROGRESS_REPACK_PHASE_REBUILD_INDEX		7
 #define PROGRESS_REPACK_PHASE_FINAL_CLEANUP		8
 
+/*
+ * Progress parameters for ALTER TABLE.
+ *
+ * finish_heap_swap() and reindex_relation() report the phase and the index
+ * rebuild count using the REPACK numbering, so the phase values of swapping,
+ * rebuilding indexes and final cleanup, and the rebuild count parameter,
+ * must stay the same.  While indexes are rebuilt, the index AMs write
+ * parameters 10-12 (not used here) and the generic block counters 15 and 16,
+ * which are deliberately used for the block counts, so that the heap scan of
+ * each index build shows up as block progress.  Parameter 7 is unused.
+ */
+#define PROGRESS_ALTER_TABLE_COMMAND				0
+#define PROGRESS_ALTER_TABLE_PHASE					PROGRESS_REPACK_PHASE
+#define PROGRESS_ALTER_TABLE_RELATIONS_TOTAL		2
+#define PROGRESS_ALTER_TABLE_RELATIONS_DONE			3
+#define PROGRESS_ALTER_TABLE_TUPLES_SCANNED			4
+#define PROGRESS_ALTER_TABLE_CURRENT_CONSTRAINT		5
+#define PROGRESS_ALTER_TABLE_CURRENT_RELID			6
+#define PROGRESS_ALTER_TABLE_BLOCKS_TOTAL			PROGRESS_SCAN_BLOCKS_TOTAL
+#define PROGRESS_ALTER_TABLE_BLOCKS_DONE			PROGRESS_SCAN_BLOCKS_DONE
+#define PROGRESS_ALTER_TABLE_INDEX_REBUILD_TOTAL	8
+#define PROGRESS_ALTER_TABLE_INDEX_REBUILD_DONE		PROGRESS_REPACK_INDEX_REBUILD_COUNT
+#define PROGRESS_ALTER_TABLE_FKEYS_TOTAL			13
+#define PROGRESS_ALTER_TABLE_FKEYS_DONE				14
+
+/* Phases of ALTER TABLE (as advertised via PROGRESS_ALTER_TABLE_PHASE) */
+#define PROGRESS_ALTER_TABLE_PHASE_SCAN_TABLE		1
+#define PROGRESS_ALTER_TABLE_PHASE_REWRITE_TABLE	2
+#define PROGRESS_ALTER_TABLE_PHASE_COPY_RELATION	3
+#define PROGRESS_ALTER_TABLE_PHASE_SWAP_REL_FILES	PROGRESS_REPACK_PHASE_SWAP_REL_FILES
+#define PROGRESS_ALTER_TABLE_PHASE_REBUILD_INDEX	PROGRESS_REPACK_PHASE_REBUILD_INDEX
+#define PROGRESS_ALTER_TABLE_PHASE_FINAL_CLEANUP	PROGRESS_REPACK_PHASE_FINAL_CLEANUP
+#define PROGRESS_ALTER_TABLE_PHASE_VALIDATE_FKEYS	9
+
+/* Commands of ALTER TABLE (as advertised via PROGRESS_ALTER_TABLE_COMMAND) */
+#define PROGRESS_ALTER_TABLE_COMMAND_TABLE			1
+#define PROGRESS_ALTER_TABLE_COMMAND_INDEX			2
+#define PROGRESS_ALTER_TABLE_COMMAND_MATVIEW		3
+#define PROGRESS_ALTER_TABLE_COMMAND_FOREIGN_TABLE	4
+#define PROGRESS_ALTER_TABLE_COMMAND_TYPE			5
+
 /* Progress parameters for CREATE INDEX */
 /* 3, 4 and 5 reserved for "waitfor" metrics */
 #define PROGRESS_CREATEIDX_COMMAND				0

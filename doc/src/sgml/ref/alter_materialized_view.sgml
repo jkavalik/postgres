@@ -78,7 +78,10 @@ ALTER MATERIALIZED VIEW ALL IN TABLESPACE <replaceable class="parameter">name</r
    for <command>ALTER TABLE</command>, and have the same meaning when used for
    materialized views.  See the descriptions for
    <link linkend="sql-altertable"><command>ALTER TABLE</command></link>
-   for details.
+   for details.  The progress of subforms that rewrite or move the
+   materialized view can be monitored in the
+   <structname>pg_stat_progress_alter_table</structname> view; see
+   <xref linkend="alter-table-progress-reporting"/>.
   </para>
  </refsect1>
 

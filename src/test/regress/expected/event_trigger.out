@@ -639,6 +639,44 @@ ERROR:  cannot alter type "rewritetype" because column "rewritemetoo3.a" uses it
 drop table rewriteme;
 drop event trigger no_rewrite_allowed;
 drop function test_evtrig_no_rewrite();
+-- ALTER TABLE progress reporting: index_rebuild_total is computed after the
+-- table_rewrite event trigger has run, so an index it drops is not counted.
+CREATE FUNCTION ap_rewrite_print(int) RETURNS int
+LANGUAGE plpgsql IMMUTABLE AS $$
+DECLARE
+    r record;
+BEGIN
+    PERFORM pg_catalog.pg_stat_clear_snapshot();
+    SELECT phase, index_rebuild_done, index_rebuild_total INTO r
+      FROM pg_catalog.pg_stat_progress_alter_table
+     WHERE pid = pg_catalog.pg_backend_pid();
+    IF r.phase IS NOT NULL THEN
+        RAISE INFO '%, indexes %/%',
+            r.phase, r.index_rebuild_done, r.index_rebuild_total;
+    END IF;
+    RETURN $1;
+END
+$$;
+CREATE TABLE ap_rewrite (a int, b int);
+INSERT INTO ap_rewrite VALUES (1, 1);
+CREATE INDEX ap_rewrite_keep ON ap_rewrite (ap_rewrite_print(a));
+CREATE INDEX ap_rewrite_drop ON ap_rewrite (a);
+CREATE FUNCTION ap_drop_index() RETURNS event_trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF pg_event_trigger_table_rewrite_oid() = 'ap_rewrite'::regclass THEN
+        DROP INDEX ap_rewrite_drop;
+    END IF;
+END
+$$;
+CREATE EVENT TRIGGER ap_drop_index ON table_rewrite
+    EXECUTE FUNCTION ap_drop_index();
+ALTER TABLE ap_rewrite ALTER b TYPE bigint;
+INFO:  rebuilding index, indexes 0/1
+DROP EVENT TRIGGER ap_drop_index;
+DROP FUNCTION ap_drop_index();
+DROP TABLE ap_rewrite;
+DROP FUNCTION ap_rewrite_print(int);
 -- Tests for REINDEX
 CREATE OR REPLACE FUNCTION reindex_start_command()
 RETURNS event_trigger AS $$

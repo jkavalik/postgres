@@ -1413,6 +1413,41 @@ CREATE VIEW pg_stat_progress_cluster AS
         index_rebuild_count
     FROM pg_stat_progress_repack;
 
+CREATE VIEW pg_stat_progress_alter_table AS
+    SELECT
+        S.pid AS pid,
+        S.datid AS datid,
+        D.datname AS datname,
+        S.relid AS relid,
+        CASE S.param1 WHEN 1 THEN 'ALTER TABLE'
+                      WHEN 2 THEN 'ALTER INDEX'
+                      WHEN 3 THEN 'ALTER MATERIALIZED VIEW'
+                      WHEN 4 THEN 'ALTER FOREIGN TABLE'
+                      WHEN 5 THEN 'ALTER TYPE'
+                      END AS command,
+        CASE S.param2 WHEN 0 THEN 'initializing'
+                      WHEN 1 THEN 'scanning table'
+                      WHEN 2 THEN 'rewriting table'
+                      WHEN 3 THEN 'copying relation'
+                      WHEN 6 THEN 'swapping relation files'
+                      WHEN 7 THEN 'rebuilding index'
+                      WHEN 8 THEN 'performing final cleanup'
+                      WHEN 9 THEN 'validating foreign keys'
+                      END AS phase,
+        CAST(S.param7 AS oid) AS current_relid,
+        S.param3 AS relations_total,
+        S.param4 AS relations_done,
+        CAST(S.param6 AS oid) AS current_constraint,
+        S.param14 AS fkeys_total,
+        S.param15 AS fkeys_done,
+        CASE S.param5 WHEN -1 THEN NULL ELSE S.param5 END AS tuples_scanned,
+        CASE S.param16 WHEN -1 THEN NULL ELSE S.param16 END AS blocks_total,
+        CASE S.param17 WHEN -1 THEN NULL ELSE S.param17 END AS blocks_done,
+        S.param9 AS index_rebuild_total,
+        S.param10 AS index_rebuild_done
+    FROM pg_stat_get_progress_info('ALTER TABLE') AS S
+        LEFT JOIN pg_database D ON S.datid = D.oid;
+
 CREATE VIEW pg_stat_progress_create_index AS
     SELECT
         S.pid AS pid, S.datid AS datid, D.datname AS datname,

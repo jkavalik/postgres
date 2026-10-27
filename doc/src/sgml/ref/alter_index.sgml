@@ -273,6 +273,12 @@ ALTER INDEX ALL IN TABLESPACE <replaceable class="parameter">name</replaceable> 
    <para>
     Changing any part of a system catalog index is not permitted.
    </para>
+
+   <para>
+    The progress of moving an index to a new tablespace can be monitored in
+    the <structname>pg_stat_progress_alter_table</structname> view; see
+    <xref linkend="alter-table-progress-reporting"/>.
+   </para>
  </refsect1>
 
  <refsect1>

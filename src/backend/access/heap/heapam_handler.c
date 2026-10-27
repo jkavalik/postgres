@@ -1985,6 +1985,24 @@ heapam_scan_get_blocks_done(HeapScanDesc hscan)
 	return blocks_done;
 }
 
+/*
+ * Return the position of a heap sequential scan, for progress reporting by
+ * code outside the heap AM: the number of blocks the scan covers, and the
+ * number read before the current one (see heapam_scan_get_blocks_done).
+ */
+void
+heap_scan_get_progress(TableScanDesc sscan, BlockNumber *total,
+					   BlockNumber *done)
+{
+	HeapScanDesc hscan = (HeapScanDesc) sscan;
+
+	if (sscan->rs_parallel != NULL)
+		*total = ((ParallelBlockTableScanDesc) sscan->rs_parallel)->phs_nblocks;
+	else
+		*total = hscan->rs_nblocks;
+	*done = heapam_scan_get_blocks_done(hscan);
+}
+
 
 /* ------------------------------------------------------------------------
  * Miscellaneous callbacks for the heap AM

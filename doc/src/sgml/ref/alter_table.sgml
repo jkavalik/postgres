@@ -1630,6 +1630,13 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
    </para>
 
    <para>
+    When <command>ALTER TABLE</command> scans, rewrites or copies a table, or
+    validates a foreign key, its progress can be monitored in the
+    <structname>pg_stat_progress_alter_table</structname> view; see
+    <xref linkend="alter-table-progress-reporting"/>.
+   </para>
+
+   <para>
     Refer to <xref linkend="sql-createtable"/> for a further description of valid
     parameters. <xref linkend="ddl"/> has further information on
     inheritance.
