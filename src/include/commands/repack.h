@@ -56,7 +56,8 @@ extern void finish_heap_swap(Oid OIDOldHeap, Oid OIDNewHeap,
 							 bool reindex,
 							 TransactionId frozenXid,
 							 MultiXactId cutoffMulti,
-							 char newrelpersistence);
+							 char newrelpersistence,
+							 bool report_progress);
 
 extern void HandleRepackMessageInterrupt(void);
 extern void ProcessRepackMessages(void);

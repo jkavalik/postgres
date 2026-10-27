@@ -4064,6 +4064,11 @@ reindex_index(const ReindexStmt *stmt, Oid indexId,
  * REINDEX_REL_FORCE_INDEXES_PERMANENT: if true, set the persistence of the
  * rebuilt indexes to permanent.
  *
+ * REINDEX_REL_REPORT_REBUILD_COUNT: if true, report the number of indexes
+ * rebuilt so far as progress parameter PROGRESS_REPACK_INDEX_REBUILD_COUNT.
+ * Only callers that run their own progress command with that parameter
+ * should pass this.
+ *
  * Returns true if any indexes were rebuilt (including toast table's index
  * when relevant).  Note that a CommandCounterIncrement will occur after each
  * index rebuild.
@@ -4203,8 +4208,9 @@ reindex_relation(const ReindexStmt *stmt, Oid relid, int flags,
 		Assert(!ReindexIsProcessingIndex(indexOid));
 
 		/* Set index rebuild count */
-		pgstat_progress_update_param(PROGRESS_REPACK_INDEX_REBUILD_COUNT,
-									 i);
+		if (flags & REINDEX_REL_REPORT_REBUILD_COUNT)
+			pgstat_progress_update_param(PROGRESS_REPACK_INDEX_REBUILD_COUNT,
+										 i);
 		i++;
 	}
 

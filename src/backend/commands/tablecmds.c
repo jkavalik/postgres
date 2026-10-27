@@ -6073,7 +6073,8 @@ ATRewriteTables(AlterTableStmt *parsetree, List **wqueue, LOCKMODE lockmode,
 							 true,	/* reindex */
 							 RecentXmin,
 							 ReadNextMultiXactId(),
-							 persistence);
+							 persistence,
+							 false);
 
 			InvokeObjectPostAlterHook(RelationRelationId, tab->relid, 0);
 		}

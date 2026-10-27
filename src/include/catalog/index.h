@@ -172,6 +172,7 @@ extern void reindex_index(const ReindexStmt *stmt, Oid indexId,
 #define REINDEX_REL_CHECK_CONSTRAINTS		0x04
 #define REINDEX_REL_FORCE_INDEXES_UNLOGGED	0x08
 #define REINDEX_REL_FORCE_INDEXES_PERMANENT 0x10
+#define REINDEX_REL_REPORT_REBUILD_COUNT	0x20
 
 extern bool reindex_relation(const ReindexStmt *stmt, Oid relid, int flags,
 							 const ReindexParams *params);

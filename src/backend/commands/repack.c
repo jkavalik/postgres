@@ -1253,7 +1253,8 @@ rebuild_relation(Relation OldHeap, Relation index, bool verbose,
 						 swap_toast_by_content, false, true,
 						 true,	/* reindex */
 						 frozenXid, cutoffMulti,
-						 relpersistence);
+						 relpersistence,
+						 true); /* report_progress */
 	}
 }
 
@@ -2034,6 +2035,10 @@ swap_relation_files(Oid r1, Oid r2, bool target_is_pg_class,
 /*
  * Remove the transient table that was built by make_new_heap, and finish
  * cleaning up (including rebuilding all indexes on the old heap).
+ *
+ * If report_progress is true, the swap, index rebuild and cleanup phases and
+ * the index rebuild count are reported using the PROGRESS_REPACK_* parameter
+ * numbering; the caller must be running a progress command that uses it.
  */
 void
 finish_heap_swap(Oid OIDOldHeap, Oid OIDNewHeap,
@@ -2044,15 +2049,17 @@ finish_heap_swap(Oid OIDOldHeap, Oid OIDNewHeap,
 				 bool reindex,
 				 TransactionId frozenXid,
 				 MultiXactId cutoffMulti,
-				 char newrelpersistence)
+				 char newrelpersistence,
+				 bool report_progress)
 {
 	ObjectAddress object;
 	Oid			mapped_tables[4];
 	int			i;
 
 	/* Report that we are now swapping relation files */
-	pgstat_progress_update_param(PROGRESS_REPACK_PHASE,
-								 PROGRESS_REPACK_PHASE_SWAP_REL_FILES);
+	if (report_progress)
+		pgstat_progress_update_param(PROGRESS_REPACK_PHASE,
+									 PROGRESS_REPACK_PHASE_SWAP_REL_FILES);
 
 	/* Zero out possible results from swapped_relation_files */
 	memset(mapped_tables, 0, sizeof(mapped_tables));
@@ -2109,15 +2116,20 @@ finish_heap_swap(Oid OIDOldHeap, Oid OIDNewHeap,
 			reindex_flags |= REINDEX_REL_FORCE_INDEXES_PERMANENT;
 
 		/* Report that we are now reindexing relations */
-		pgstat_progress_update_param(PROGRESS_REPACK_PHASE,
-									 PROGRESS_REPACK_PHASE_REBUILD_INDEX);
+		if (report_progress)
+		{
+			reindex_flags |= REINDEX_REL_REPORT_REBUILD_COUNT;
+			pgstat_progress_update_param(PROGRESS_REPACK_PHASE,
+										 PROGRESS_REPACK_PHASE_REBUILD_INDEX);
+		}
 
 		reindex_relation(NULL, OIDOldHeap, reindex_flags, &reindex_params);
 	}
 
 	/* Report that we are now doing clean up */
-	pgstat_progress_update_param(PROGRESS_REPACK_PHASE,
-								 PROGRESS_REPACK_PHASE_FINAL_CLEANUP);
+	if (report_progress)
+		pgstat_progress_update_param(PROGRESS_REPACK_PHASE,
+									 PROGRESS_REPACK_PHASE_FINAL_CLEANUP);
 
 	/*
 	 * If the relation being rebuilt is pg_class, swap_relation_files()
@@ -3626,7 +3638,8 @@ rebuild_relation_finish_concurrent(Relation NewHeap, Relation OldHeap,
 					 true,
 					 false,		/* reindex */
 					 frozenXid, cutoffMulti,
-					 relpersistence);
+					 relpersistence,
+					 true);		/* report_progress */
 }
 
 /*
